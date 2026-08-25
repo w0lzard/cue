@@ -5,6 +5,7 @@
   const $ = (s) => document.querySelector(s);
   const isWindows = cue.platform === 'win32';
   const isMac = cue.platform === 'darwin';
+  const isLinux = cue.platform === 'linux';
 
   // Exiting must work before settings or provider setup has completed.
   const quitButton = $('#quit-btn');
@@ -418,7 +419,7 @@
     
     // FIX #10: Show undo hint when explicitly cleared
     if (showUndoHint && hadContent) {
-      const undoHint = isWindows ? 'Ctrl+Z to undo' : '⌘Z to undo';
+      const undoHint = (isWindows || isLinux) ? 'Ctrl+Z to undo' : '⌘Z to undo';
       showToast(`Cleared · ${undoHint}`, 2000);
     }
   }
@@ -538,7 +539,7 @@
   // FIX #4: Add tooltip with keyboard shortcuts to send button
   const sendBtn = document.getElementById('send-btn');
   if (sendBtn) {
-    const forceKey = isWindows ? 'Ctrl+Shift+A' : '⌘⇧A';
+    const forceKey = (isWindows || isLinux) ? 'Ctrl+Shift+A' : '⌘⇧A';
     sendBtn.title = `Send · ${forceKey} to force answer`;
   }
 
@@ -734,9 +735,11 @@
       if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
         showStatus('No microphone was found. Plug one in, or pick a default input device in your OS sound settings, then try again.');
       } else if (name === 'NotAllowedError' || name === 'PermissionDeniedError' || name === 'SecurityError') {
-        showStatus(isWindows
-          ? 'Microphone permission was denied. Settings → Privacy & security → Microphone → allow cue, then try again.'
-          : 'Microphone permission was denied. System Settings → Privacy & Security → Microphone → allow cue, then try again.');
+        showStatus(isMac
+          ? 'Microphone permission was denied. System Settings → Privacy & Security → Microphone → allow cue, then try again.'
+          : isWindows
+            ? 'Microphone permission was denied. Settings → Privacy & security → Microphone → allow cue, then try again.'
+            : 'Microphone permission was denied. Check your desktop environment settings to allow cue, then try again.');
       } else if (name === 'NotReadableError' || name === 'TrackStartError') {
         showStatus('The microphone could not be started — another application may be using it exclusively. Close other apps using the mic and try again.');
       } else {
@@ -781,16 +784,40 @@
       return;
     }
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
-
-      stream.getVideoTracks().forEach((t) => t.stop()); // we only want the audio
+      let stream;
+      if (isLinux) {
+        // Chromium doesn't list monitor sources as inputs, so getDisplayMedia has no
+        // system-audio path here. The main process exposes the default sink's monitor
+        // as a regular source (src/linux-loopback.js); capture it as if it were a mic.
+        const prep = await cue.systemAudioPrepare();
+        if (!prep || !prep.ok) {
+          cue.log('system audio: loopback setup failed: ' + (prep && prep.error));
+          showStatus('Meeting audio needs PulseAudio or PipeWire (pactl). Your screen and microphone still work.');
+          return;
+        }
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const loopback = devices.find((d) => d.kind === 'audioinput' && d.label.includes('CueSystemAudio'));
+        if (!loopback) {
+          cue.log('system audio: CueSystemAudio source not listed after setup');
+          showStatus('Meeting audio source did not appear. Check that pipewire-pulse is running, then try again. Your screen and microphone still work.');
+          return;
+        }
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: { deviceId: { exact: loopback.deviceId }, echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+        });
+      } else {
+        stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+        stream.getVideoTracks().forEach((t) => t.stop()); // we only want the audio
+      }
       const tracks = stream.getAudioTracks();
       if (!tracks.length) {
         cue.log('system audio: no loopback track on this platform');
         stream.getTracks().forEach((t) => t.stop());
-        showStatus(cue.platform === 'win32'
-          ? 'No system-audio loopback track detected. Make sure "Share audio" is checked in the screen share dialog, and that your audio device is not in exclusive mode.'
-          : 'No system-audio loopback track detected. Meeting audio needs macOS 14.4+ — your screen and microphone still work.');
+        showStatus(isMac
+          ? 'No system-audio loopback track detected. Meeting audio needs macOS 14.4+ — your screen and microphone still work.'
+          : isWindows
+            ? 'No system-audio loopback track detected. Make sure "Share audio" is checked in the screen share dialog, and that your audio device is not in exclusive mode.'
+            : 'No system-audio loopback track detected. Check that meeting audio plays through the default output device. Your screen and microphone still work.');
         return;
       }
       sysStream = stream;
@@ -1814,7 +1841,28 @@
   // ---- click-through: only the UI blocks the mouse; empty gaps pass to your screen ----
   let ignoring = null;
   let draggingWindow = false;
-  function setIgnore(v) { if (v !== ignoring) { ignoring = v; cue.setIgnoreMouse(v); } }
+  // Linux has no mousemove forwarding through an ignored window, so there the main
+  // process drives click-through (X11: polls the cursor against reported UI rects;
+  // Wayland: window stays interactive) and this stays a no-op.
+  function setIgnore(v) { if (isLinux) return; if (v !== ignoring) { ignoring = v; cue.setIgnoreMouse(v); } }
+  if (isLinux && cue.sessionType !== 'wayland') {
+    const roots = ['#toolbar', '#panel-wrap', '#transcript-sidebar', '#settings-scrim', '#onboard-scrim', '#consent-scrim'];
+    const report = () => cue.reportUiRects(roots
+      .map((q) => document.querySelector(q))
+      .filter((el) => el && !el.classList.contains('hidden') && el.offsetParent !== null)
+      .map((el) => {
+        const r = el.getBoundingClientRect();
+        return { x: Math.floor(r.left), y: Math.floor(r.top), w: Math.ceil(r.width), h: Math.ceil(r.height) };
+      }));
+    const ro = new ResizeObserver(report);
+    const mo = new MutationObserver(report);
+    roots.forEach((q) => {
+      const el = document.querySelector(q);
+      if (el) { ro.observe(el); mo.observe(el, { attributes: true, attributeFilter: ['class', 'style'] }); }
+    });
+    window.addEventListener('resize', report);
+    report();
+  }
   document.addEventListener('mousemove', (e) => {
     // The window trails the cursor while dragging; going click-through then would drop the release.
     if (draggingWindow) return;
@@ -1882,11 +1930,18 @@
 
   // ---- onboarding / first-run tutorial -----------------------------------
   const obScrim = $('#onboard-scrim');
-  const permissionHelp = isWindows
-    ? 'cue needs permission to see and hear. Open Windows Privacy & security settings, allow <strong>Microphone</strong> and <strong>Screen recording</strong> for cue, then come back here.'
-    : 'cue needs two macOS permissions. Click each button, turn <strong>cue</strong> ON in the window that opens, then come back here.';
-  const permissionButtons = isWindows
+  const permissionHelp = isMac
+    ? 'cue needs two macOS permissions. Click each button, turn <strong>cue</strong> ON in the window that opens, then come back here.'
+    : isWindows
+      ? 'cue needs permission to see and hear. Open Windows Privacy & security settings, allow <strong>Microphone</strong> and <strong>Screen recording</strong> for cue, then come back here.'
+      : 'cue needs permission to see and hear. Check system sound and screen sharing settings in your desktop environment.';
+  const permissionButtons = isMac
     ? [
+        { label: 'Open Microphone settings', action: () => cue.openPane('x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone') },
+        { label: 'Open Screen Recording settings', action: () => cue.openPane('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture') }
+      ]
+    : isWindows
+      ? [
         { label: 'Open Microphone settings', action: () => cue.openPane('ms-settings:privacy-microphone') },
         { label: 'Open Screen recording settings', action: () => cue.openPane('ms-settings:privacy-screenrecorder') }
       ]
@@ -1894,9 +1949,9 @@
         { label: 'Open Microphone settings', action: () => cue.openPane('x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone') },
         { label: 'Open Screen Recording settings', action: () => cue.openPane('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture') }
       ];
-  const assistShortcut = isWindows ? '<span class="kbd">Ctrl</span><span class="kbd">⇧</span><span class="kbd">↵</span>' : '<span class="kbd">⌘</span><span class="kbd">⇧</span><span class="kbd">↵</span>';
-  const sayShortcut = isWindows ? '<span class="kbd">Ctrl</span> <span class="kbd">↵</span>' : '<span class="kbd">⌘</span> <span class="kbd">↵</span>';
-  const quitShortcut = isWindows ? '<span class="kbd">Ctrl</span><span class="kbd">⇧</span><span class="kbd">X</span>' : '<span class="kbd">⌘</span><span class="kbd">⇧</span><span class="kbd">X</span>';
+  const assistShortcut = !isMac ? '<span class="kbd">Ctrl</span><span class="kbd">⇧</span><span class="kbd">↵</span>' : '<span class="kbd">⌘</span><span class="kbd">⇧</span><span class="kbd">↵</span>';
+  const sayShortcut = !isMac ? '<span class="kbd">Ctrl</span> <span class="kbd">↵</span>' : '<span class="kbd">⌘</span> <span class="kbd">↵</span>';
+  const quitShortcut = !isMac ? '<span class="kbd">Ctrl</span><span class="kbd">⇧</span><span class="kbd">X</span>' : '<span class="kbd">⌘</span><span class="kbd">⇧</span><span class="kbd">X</span>';
   const OB_STEPS = [
     {
       icon: '👋',
@@ -2047,14 +2102,14 @@
     // R4: shortcut hints
     const sayHintEl = document.getElementById('say-shortcut-hint');
     const assistHintEl = document.getElementById('assist-shortcut-hint');
-    if (sayHintEl) sayHintEl.textContent = isWindows ? 'Ctrl+↵' : '⌘↵';
-    if (assistHintEl) assistHintEl.textContent = isWindows ? 'Ctrl+Shift+↵' : '⌘⇧↵';
+    if (sayHintEl) sayHintEl.textContent = !isMac ? 'Ctrl+↵' : '⌘↵';
+    if (assistHintEl) assistHintEl.textContent = !isMac ? 'Ctrl+Shift+↵' : '⌘⇧↵';
     const sayBtn = document.querySelector('.act[data-mode="say"]');
     const assistBtn = document.querySelector('.act[data-mode="assist"]');
-    if (sayBtn) sayBtn.title = isWindows
+    if (sayBtn) sayBtn.title = !isMac
       ? 'Suggests what to say next based on the conversation (Ctrl+Enter)'
       : 'Suggests what to say next based on the conversation (⌘↵)';
-    if (assistBtn) assistBtn.title = isWindows
+    if (assistBtn) assistBtn.title = !isMac
       ? 'Scans your screen and conversation to decide what you need (Ctrl+Shift+Enter)'
       : 'Scans your screen and conversation to decide what you need (⌘⇧↵)';
 
@@ -2077,7 +2132,7 @@
     updateSendButtonState(); // Initialize send button state
 
     // Fix placeholder shortcut hint to match platform
-    if (isWindows) {
+    if (!isMac) {
       placeholder.innerHTML = 'Ask about your screen or conversation, or <span class="keycap">Ctrl</span><span class="keycap">⇧</span><span class="keycap">⏎</span> for Smart assist';
     }
 

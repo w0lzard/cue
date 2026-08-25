@@ -1,8 +1,10 @@
 const { contextBridge, ipcRenderer } = require('electron');
 const platform = process.platform;
+const sessionType = process.env.XDG_SESSION_TYPE || '';
 
 contextBridge.exposeInMainWorld('cue', {
   platform,
+  sessionType,
   settingsGet: () => ipcRenderer.invoke('settings:get'),
   settingsSet: (patch) => ipcRenderer.invoke('settings:set', patch),
   whisperModels: () => ipcRenderer.invoke('whisper:models'),
@@ -34,7 +36,9 @@ contextBridge.exposeInMainWorld('cue', {
   publikDisconnect: () => ipcRenderer.invoke('publik:disconnect'),
   publikCardSeen: () => ipcRenderer.invoke('publik:card-seen'),
   publikOpen: (url) => ipcRenderer.send('publik:open', url),
+  systemAudioPrepare: () => ipcRenderer.invoke('system-audio:prepare'),
   appLinkState: () => ipcRenderer.invoke('applink:state'),
+  reportUiRects: (rects) => ipcRenderer.send('mouse:rects', rects),
   appLinkRevoke: (callerId) => ipcRenderer.invoke('applink:revoke', callerId),
   appLinkConsentRespond: (id, allowed) => ipcRenderer.send('applink:consent-response', { id, allowed }),
   pickProfileDocument: () => ipcRenderer.invoke('profile:pickDocument'),

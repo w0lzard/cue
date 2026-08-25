@@ -48,6 +48,7 @@ const { WhisperModelManager } = require('./src/whisper-model-manager');
 const { requireWhisperModel } = require('./src/whisper-model-catalog');
 const { locateWhisperRuntime } = require('./src/whisper-runtime');
 const { LocalWhisperTranscriber } = require('./src/local-whisper-transcriber');
+const { ensureLoopbackSource, unloadLoopbackSource } = require('./src/linux-loopback');
 
 let win = null;
 // Which global shortcuts cue actually holds. `globalShortcut.register` returns
@@ -334,6 +335,10 @@ function createWindow() {
   win.setAlwaysOnTop(true, 'screen-saver', 1);
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   if (isMac && typeof win.setHiddenInMissionControl === 'function') win.setHiddenInMissionControl(true);
+  if (isLinux && !isWaylandSession) {
+    startCursorHover(win);
+    win.on('closed', () => { clearInterval(cursorHoverTimer); cursorHoverTimer = null; });
+  }
 
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
 
@@ -361,6 +366,10 @@ function createWindow() {
     if (isWindows && shouldProtect && !WIN_SUPPORTS_CONTENT_PROTECTION) {
       send('status', {
         message: `Heads up: your Windows version (build ${WIN_BUILD}) does not support screen-share hiding. Upgrade to Windows 10 build 19041+ or Windows 11 to enable invisibility in screen shares.`
+      });
+    } else if (isLinux && shouldProtect) {
+      send('status', {
+        message: 'Heads up: Linux does not support screen-share window hiding via standard desktop APIs. The cue window will be visible in screen shares.'
       });
     }
     // Warn when protection was skipped because this is not a local console
@@ -812,7 +821,7 @@ async function runFeature(mode, userText) {
           ? 'Screen capture needs permission — grant Screen Recording to cue in System Settings.'
           : process.platform === 'win32'
             ? 'Screen capture failed. Make sure cue is not blocked by Windows privacy or security software, then try again.'
-            : 'Screen capture failed. Check your desktop capture permissions, then try again.';
+            : 'Screen capture failed. Check your X11 or Wayland screen capture permissions (xdg-desktop-portal / PipeWire), then try again.';
         send('status', { message });
       }
     }
@@ -1135,6 +1144,7 @@ ipcMain.handle('slides:clear', () => {
   return { ok: true };
 });
 ipcMain.on('ask', (_e, payload) => runFeature(payload.mode, payload.text));
+ipcMain.handle('system-audio:prepare', async () => (isLinux ? ensureLoopbackSource() : { ok: true }));
 ipcMain.on('mic:pcm', (_e, arrayBuffer) => { if (state.capturing) routeAudio('you', arrayBuffer); });
 ipcMain.on('system:pcm', (_e, arrayBuffer) => { if (state.capturing) routeAudio('them', arrayBuffer); });
 ipcMain.on('mouse:ignore', (_e, v) => { if (win) win.setIgnoreMouseEvents(!!v, { forward: true }); });
@@ -1166,6 +1176,31 @@ function stopWindowDrag() {
 ipcMain.on('open-pane', (_e, url) => { shell.openExternal(url).catch(() => {}); });
 ipcMain.on('app:quit', () => app.quit());
 ipcMain.on('log', (_e, msg) => console.log('[renderer]', msg));
+// Linux: { forward: true } mousemove forwarding is not implemented there, so the
+// renderer's hover-based re-enable never fires and the window stays click-through.
+// On X11 the renderer reports its interactive rectangles (CSS px == DIP here) and
+// the main process polls the cursor against them. On Wayland there is no global
+// cursor query either (getCursorScreenPoint returns stale coords), so the window
+// just stays interactive: gaps in it block clicks to windows below.
+const isWaylandSession = isLinux && (process.env.XDG_SESSION_TYPE === 'wayland' || !!process.env.WAYLAND_DISPLAY);
+let uiRects = [];
+let cursorHoverTimer = null;
+let cursorHoverInteractive = null;
+ipcMain.on('mouse:rects', (_e, rects) => { uiRects = Array.isArray(rects) ? rects : []; });
+function startCursorHover(win) {
+  cursorHoverTimer = setInterval(() => {
+    if (!win || win.isDestroyed()) return;
+    const cursor = screen.getCursorScreenPoint();
+    const b = win.getContentBounds();
+    const x = cursor.x - b.x, y = cursor.y - b.y;
+    const hit = uiRects.some((r) => x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h);
+    if (hit !== cursorHoverInteractive) {
+      cursorHoverInteractive = hit;
+      win.setIgnoreMouseEvents(!hit);
+    }
+  }, 30);
+}
+
 // -------- resume / job-description file import --------
 // The dialog runs in MAIN and is filtered to pdf/docx; the renderer never supplies a path.
 // The parsed text is RETURNED to the renderer, which drops it into the existing
@@ -1380,7 +1415,7 @@ function launchApp() {
     // "One-time callback was called more than once" bug happened before.
     const allowed = !isMac || Boolean(store.getSettings().meetingAudio);
     (allowed ? desktopCapturer.getSources({ types: ['screen'] }) : Promise.resolve([]))
-      .then((sources) => (sources.length ? { video: sources[0], audio: 'loopback' } : undefined))
+      .then((sources) => (sources.length ? { video: sources[0], ...(isLinux ? {} : { audio: 'loopback' }) } : undefined))
       .catch((err) => {
         console.error('[main] system audio: desktopCapturer.getSources failed:', err);
         return undefined;
@@ -1446,6 +1481,7 @@ app.whenReady().then(async () => {
 });
 
 app.on('will-quit', () => {
+  if (isLinux) unloadLoopbackSource();
   globalShortcut.unregisterAll();
   // Quitting mid-meeting is a pause, not an end: the meeting stays open on disk
   // so a relaunch within the resume window picks it back up (a stale one is
